@@ -1,0 +1,24 @@
+# Compiled binaries
+rfid_gc_live
+rfid_gc_live.exe
+rfid_standard
+rfid_standard.exe
+
+# Object files
+*.o
+*.obj
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
