@@ -83,24 +83,23 @@
 // Configuration
 #define GC_PORT             "/dev/ttyACM0"
 #define GC_BAUDRATE         921600
-#define DEFAULT_POWER_MW    316           // R3100C Lepton3 max; required for constant reads
+#define DEFAULT_POWER_MW    30            // matches working rfid_standard on this rig; pass 316 if needed
 #define MIN_POWER_MW        1
 #define MAX_POWER_MW        316
-#define GC_WINDOW_MS        250           // decision window length -> ~4 lines / sec
+#define GC_WINDOW_MS        100           // align with rfid_standard line rate
 #define GC_MAX_TAGS         64
 #define ANTENNA_COUNT       2
 #define MAX_ID_LENGTH       64
 
-// Arbitration thresholds. Counts are the primary signal here because
-// the RSSI delta between adjacent antennas in this rig is too small
-// to arbitrate on alone. All values err on the side of stickiness:
-// when in doubt we keep the existing attribution rather than risk a
-// cross-read into the wrong slot.
-#define RSSI_FLOOR_DBM10    (-750)        // -75.0 dBm: ignore weaker reads as leakage
-#define MIN_READS           ( 2)          // minimum reads on winning antenna per window
-#define COUNT_DOM_FIRST     ( 2)          // claim a new owner: winner >= 2x loser this window
-#define COUNT_DOM_FLIP      ( 3)          // unseat existing owner: challenger >= 3x owner
-#define UNSEEN_TTL_WINDOWS  ( 4)          // drop EPC after this many empty windows (= ~1 s)
+// First claim: both antennas often see the same tag with equal counts (~3
+// scans/window each). Requiring 2x count dominance blocked ALL output.
+// Use RSSI margin for initial owner; stay sticky on flip (3x count).
+#define RSSI_FLOOR_DBM10       (-800)     // -80.0 dBm
+#define RSSI_CLAIM_MARGIN_DB10 ( 15)      // 1.5 dB: prefer stronger antenna on first claim
+#define MIN_READS              ( 1)
+#define COUNT_DOM_FIRST        ( 2)       // optional count path when counts differ
+#define COUNT_DOM_FLIP         ( 3)       // flip existing owner only with strong count dominance
+#define UNSEEN_TTL_WINDOWS     ( 8)       // ~0.8 s empty before slot clears
 
 // ANSI colours
 #define GREEN  "\033[0;32m"
@@ -213,88 +212,87 @@ static void state_window_reset(TagState *s)
     s->wmax_rssi[1] = INT16_MIN;
 }
 
-// Apply sticky arbitration to one EPC at window close. Returns true
-// if the EPC should be rendered in this sweep's output, false if it
-// should be skipped (un-owned, evicted, or too weak this window).
-//
-// The two thresholds COUNT_DOM_FIRST and COUNT_DOM_FLIP encode the
-// asymmetry we want: it is HARDER to take ownership away from the
-// current owner than to claim a free slot. This is what kills cross-
-// reads in practice -- a stray strong ping on the wrong antenna will
-// not on its own be enough to flip the slot.
+// Pick initial owner when both antennas see the tag (typical on this rig).
+// Never requires 2x count when counts are equal -- RSSI breaks the tie.
+static bool state_claim_owner(TagState *s)
+{
+    unsigned c0 = s->wcount[0], c1 = s->wcount[1];
+    if (c0 == 0 && c1 == 0) return false;
+
+    int owner;
+    if (c0 > 0 && c1 == 0) {
+        owner = 0;
+    } else if (c1 > 0 && c0 == 0) {
+        owner = 1;
+    } else {
+        int16_t r0 = s->wmax_rssi[0], r1 = s->wmax_rssi[1];
+        int16_t rssi_margin = r0 - r1;
+
+        if (c0 > c1)
+            owner = 0;
+        else if (c1 > c0)
+            owner = 1;
+        else if (rssi_margin >= RSSI_CLAIM_MARGIN_DB10)
+            owner = 0;
+        else if (rssi_margin <= -RSSI_CLAIM_MARGIN_DB10)
+            owner = 1;
+        else if (c0 >= (unsigned)COUNT_DOM_FIRST * c1)
+            owner = 0;
+        else if (c1 >= (unsigned)COUNT_DOM_FIRST * c0)
+            owner = 1;
+        else
+            owner = (r0 >= r1) ? 0 : 1; /* equal counts, tiny RSSI gap */
+    }
+
+    if (s->wcount[owner] < (unsigned)MIN_READS) return false;
+    if (s->wmax_rssi[owner] < RSSI_FLOOR_DBM10) return false;
+
+    s->owner           = owner;
+    s->last_owner_rssi = s->wmax_rssi[owner];
+    return true;
+}
+
+// Sticky arbitration at window close.
 static bool state_arbitrate(TagState *s)
 {
     unsigned c0 = s->wcount[0], c1 = s->wcount[1];
 
-    /* Neither antenna saw it this window. Age it; evict on TTL. */
     if (c0 == 0 && c1 == 0) {
         s->unseen_windows++;
-        if (s->unseen_windows >= UNSEEN_TTL_WINDOWS) {
+        if (s->unseen_windows >= UNSEEN_TTL_WINDOWS)
             s->in_use = false;
-        }
-        return false;
+        return (s->owner >= 0); /* keep showing last owner while mug present */
     }
 
     s->unseen_windows = 0;
 
-    /* Pick this window's local winner / loser by read count, with
-       RSSI as the tiebreaker. */
-    int a, b;
-    if (c0 > c1)                                          { a = 0; b = 1; }
-    else if (c1 > c0)                                     { a = 1; b = 0; }
-    else if (s->wmax_rssi[0] >= s->wmax_rssi[1])          { a = 0; b = 1; }
-    else                                                  { a = 1; b = 0; }
+    if (s->owner < 0)
+        return state_claim_owner(s);
 
-    /* Leakage floor: if the strongest read this window is below the
-       floor it is treated as no sighting at all. */
-    if (s->wmax_rssi[a] < RSSI_FLOOR_DBM10) {
-        s->unseen_windows++;
-        if (s->unseen_windows >= UNSEEN_TTL_WINDOWS) s->in_use = false;
-        return s->owner >= 0; /* still render last known owner if we have one */
-    }
+    /* Refresh RSSI when owner was seen this window. */
+    if (s->wcount[s->owner] > 0)
+        s->last_owner_rssi = s->wmax_rssi[s->owner];
 
-    if (s->owner < 0) {
-        /* No owner yet -- need a confident claim before we light up
-           any slot. */
-        if (s->wcount[a] < (unsigned)MIN_READS) return false;
-        if (s->wcount[b] == 0) {
-            s->owner = a;
-        } else if (s->wcount[a] >= (unsigned)COUNT_DOM_FIRST * s->wcount[b]) {
-            s->owner = a;
-        } else {
-            return false; /* ambiguous first sighting -- wait */
+    /* Challenger is the antenna with more reads this window (RSSI tiebreak). */
+    int chall, other;
+    if (c0 > c1)                                      { chall = 0; other = 1; }
+    else if (c1 > c0)                                 { chall = 1; other = 0; }
+    else if (s->wmax_rssi[0] >= s->wmax_rssi[1])      { chall = 0; other = 1; }
+    else                                              { chall = 1; other = 0; }
+
+    if (chall != s->owner) {
+        if (s->wcount[other] == 0) {
+            if (s->wcount[chall] >= (unsigned)COUNT_DOM_FLIP) {
+                s->owner           = chall;
+                s->last_owner_rssi = s->wmax_rssi[chall];
+            }
+        } else if (s->wcount[chall] >= (unsigned)COUNT_DOM_FLIP * s->wcount[other]) {
+            s->owner           = chall;
+            s->last_owner_rssi = s->wmax_rssi[chall];
         }
-        s->last_owner_rssi = s->wmax_rssi[a];
-        return true;
+        /* else: stay on sticky owner (no cross-read flip) */
     }
 
-    /* We already have an owner. */
-    if (a == s->owner) {
-        /* Current owner is still dominant this window. */
-        s->last_owner_rssi = s->wmax_rssi[a];
-        return true;
-    }
-
-    /* Local winner this window is the OTHER antenna. Only flip when
-       the challenger is strongly dominant; otherwise stay sticky. */
-    if (s->wcount[b] == 0) {
-        /* Owner didn't see it at all this window -- challenger needs
-           sustained reads on its own to take over. */
-        if (s->wcount[a] >= (unsigned)COUNT_DOM_FLIP) {
-            s->owner            = a;
-            s->last_owner_rssi  = s->wmax_rssi[a];
-        }
-        /* In either case still render the (possibly new) owner. */
-        return true;
-    }
-
-    if (s->wcount[a] >= (unsigned)COUNT_DOM_FLIP * s->wcount[b]) {
-        s->owner            = a;
-        s->last_owner_rssi  = s->wmax_rssi[a];
-    } else {
-        /* Owner kept its slot; refresh RSSI from this window. */
-        s->last_owner_rssi  = s->wmax_rssi[s->owner];
-    }
     return true;
 }
 
@@ -401,9 +399,10 @@ int main(int argc, char **argv) {
     printf("Power     : %u mW (both antennas)\n", power);
     printf("Window    : %d ms\n", GC_WINDOW_MS);
     printf("Antennas  : %s, %s  (150 mm centre-to-centre)\n", sources[0], sources[1]);
-    printf("Sticky    : floor=%.1f dBm, claim>=%dx, flip>=%dx, min reads=%d, TTL=%d windows\n\n",
+    printf("Sticky    : floor=%.1f dBm, RSSI claim=%.1f dB, flip>=%dx, TTL=%d windows\n\n",
            RSSI_FLOOR_DBM10 / 10.0,
-           COUNT_DOM_FIRST, COUNT_DOM_FLIP, MIN_READS, UNSEEN_TTL_WINDOWS);
+           RSSI_CLAIM_MARGIN_DB10 / 10.0,
+           COUNT_DOM_FLIP, UNSEEN_TTL_WINDOWS);
 
     printf("[GC] Connecting...\n");
     ec = CAENRFID_Connect(&reader, CAENRFID_RS232, &port_params);
