@@ -91,14 +91,19 @@
 #define ANTENNA_COUNT       2
 #define MAX_ID_LENGTH       64
 
-// First claim: both antennas often see the same tag with equal counts (~3
-// scans/window each). Requiring 2x count dominance blocked ALL output.
-// Use RSSI margin for initial owner; stay sticky on flip (3x count).
-#define RSSI_FLOOR_DBM10       (-800)     // -80.0 dBm
-#define RSSI_CLAIM_MARGIN_DB10 ( 15)      // 1.5 dB: prefer stronger antenna on first claim
-#define MIN_READS              ( 1)
-#define COUNT_DOM_FIRST        ( 2)       // optional count path when counts differ
-#define COUNT_DOM_FLIP         ( 3)       // flip existing owner only with strong count dominance
+// Attribution is gated by a NEAR-FIELD RSSI threshold rather than count
+// dominance, because counts in this rig are similar on both antennas
+// (3 scans each per window) regardless of which antenna the mug sits on.
+// Physical reality: a placed mug reads at ~-55 to -60 dBm on the home
+// antenna; leakage from a mug on the other antenna (or being carried
+// nearby) reads at ~-65 dBm or weaker. -65 dBm is the cleanest split.
+//
+// Both claim and flip are debounced so a single noisy window cannot
+// move the slot -- this is what keeps cross-reads at zero.
+#define NEAR_FIELD_DBM10       (-650)     // -65.0 dBm: "the mug is on this antenna"
+#define RSSI_CLAIM_MARGIN_DB10 ( 15)      // 1.5 dB: needed when BOTH antennas are near-field
+#define CLAIM_DEBOUNCE         ( 2)       // consecutive windows of agreement before locking owner
+#define FLIP_DEBOUNCE          ( 2)       // consecutive windows of challenger near-field before flipping
 #define UNSEEN_TTL_WINDOWS     ( 8)       // ~0.8 s empty before slot clears
 
 // ANSI colours
@@ -122,6 +127,10 @@ volatile int running = 0;
 //                       window, per antenna (INT16_MIN = not seen)
 //   unseen_windows    : consecutive windows in which neither antenna
 //                       saw this EPC; cleared on any sighting
+//   pending_owner     : candidate owner during claim debounce (-1 = none)
+//   pending_streak    : consecutive windows that agreed on pending_owner
+//   flip_streak       : consecutive windows in which the OTHER antenna
+//                       is the near-field winner (drives a sticky flip)
 //   in_use            : false slots are available for re-use after eviction
 typedef struct {
     char     epc[2 * MAX_ID_LENGTH + 1];
@@ -130,6 +139,9 @@ typedef struct {
     unsigned wcount[ANTENNA_COUNT];
     int16_t  wmax_rssi[ANTENNA_COUNT];
     int      unseen_windows;
+    int      pending_owner;
+    int      pending_streak;
+    int      flip_streak;
     bool     in_use;
 } TagState;
 
@@ -198,6 +210,9 @@ static TagState *state_find_or_insert(TagState *table, const char *epc)
     s->last_owner_rssi  = INT16_MIN;
     s->wmax_rssi[0]     = INT16_MIN;
     s->wmax_rssi[1]     = INT16_MIN;
+    s->pending_owner    = -1;
+    s->pending_streak   = 0;
+    s->flip_streak      = 0;
     s->in_use           = true;
     return s;
 }
@@ -212,53 +227,38 @@ static void state_window_reset(TagState *s)
     s->wmax_rssi[1] = INT16_MIN;
 }
 
-// Pick initial owner when both antennas see the tag (typical on this rig).
-// Never requires 2x count when counts are equal -- RSSI breaks the tie.
-static bool state_claim_owner(TagState *s)
+// Decide this window's near-field winner: the antenna whose max RSSI
+// crossed NEAR_FIELD_DBM10. If both did, the stronger one must beat
+// the other by at least RSSI_CLAIM_MARGIN_DB10; otherwise it is an
+// ambiguous window and we return -1 (no claim, no flip).
+static int window_nf_winner(const TagState *s)
 {
     unsigned c0 = s->wcount[0], c1 = s->wcount[1];
-    if (c0 == 0 && c1 == 0) return false;
+    bool nf0 = (c0 > 0 && s->wmax_rssi[0] >= NEAR_FIELD_DBM10);
+    bool nf1 = (c1 > 0 && s->wmax_rssi[1] >= NEAR_FIELD_DBM10);
 
-    int owner;
-    if (c0 > 0 && c1 == 0) {
-        owner = 0;
-    } else if (c1 > 0 && c0 == 0) {
-        owner = 1;
-    } else {
-        int16_t r0 = s->wmax_rssi[0], r1 = s->wmax_rssi[1];
-        int16_t rssi_margin = r0 - r1;
-
-        if (c0 > c1)
-            owner = 0;
-        else if (c1 > c0)
-            owner = 1;
-        else if (rssi_margin >= RSSI_CLAIM_MARGIN_DB10)
-            owner = 0;
-        else if (rssi_margin <= -RSSI_CLAIM_MARGIN_DB10)
-            owner = 1;
-        else if (c0 >= (unsigned)COUNT_DOM_FIRST * c1)
-            owner = 0;
-        else if (c1 >= (unsigned)COUNT_DOM_FIRST * c0)
-            owner = 1;
-        else
-            owner = (r0 >= r1) ? 0 : 1; /* equal counts, tiny RSSI gap */
+    if (nf0 && !nf1) return 0;
+    if (nf1 && !nf0) return 1;
+    if (nf0 && nf1) {
+        int16_t margin = s->wmax_rssi[0] - s->wmax_rssi[1];
+        if (margin >=  RSSI_CLAIM_MARGIN_DB10) return 0;
+        if (margin <= -RSSI_CLAIM_MARGIN_DB10) return 1;
     }
-
-    if (s->wcount[owner] < (unsigned)MIN_READS) return false;
-    if (s->wmax_rssi[owner] < RSSI_FLOOR_DBM10) return false;
-
-    s->owner           = owner;
-    s->last_owner_rssi = s->wmax_rssi[owner];
-    return true;
+    return -1; /* leakage or genuinely ambiguous */
 }
 
-// Sticky arbitration at window close.
+// Sticky arbitration at window close. Two-stage claim and flip protect
+// against (a) leakage claiming a slot before the mug is placed, and
+// (b) noise flipping a correctly-claimed slot to the wrong antenna.
 static bool state_arbitrate(TagState *s)
 {
     unsigned c0 = s->wcount[0], c1 = s->wcount[1];
 
     if (c0 == 0 && c1 == 0) {
         s->unseen_windows++;
+        s->pending_owner  = -1;
+        s->pending_streak = 0;
+        s->flip_streak    = 0;
         if (s->unseen_windows >= UNSEEN_TTL_WINDOWS)
             s->in_use = false;
         return (s->owner >= 0); /* keep showing last owner while mug present */
@@ -266,31 +266,50 @@ static bool state_arbitrate(TagState *s)
 
     s->unseen_windows = 0;
 
-    if (s->owner < 0)
-        return state_claim_owner(s);
+    int nf = window_nf_winner(s);
 
-    /* Refresh RSSI when owner was seen this window. */
+    if (s->owner < 0) {
+        /* Two-stage claim: need CLAIM_DEBOUNCE consecutive windows
+           agreeing on the same near-field winner before locking. */
+        if (nf < 0) {
+            s->pending_owner  = -1;
+            s->pending_streak = 0;
+            return false;
+        }
+        if (s->pending_owner == nf) {
+            s->pending_streak++;
+        } else {
+            s->pending_owner  = nf;
+            s->pending_streak = 1;
+        }
+        if (s->pending_streak >= CLAIM_DEBOUNCE) {
+            s->owner           = nf;
+            s->last_owner_rssi = s->wmax_rssi[nf];
+            s->pending_owner   = -1;
+            s->pending_streak  = 0;
+            s->flip_streak     = 0;
+            return true;
+        }
+        return false;
+    }
+
+    /* Owner already set. Refresh RSSI if owner saw the tag this window. */
     if (s->wcount[s->owner] > 0)
         s->last_owner_rssi = s->wmax_rssi[s->owner];
 
-    /* Challenger is the antenna with more reads this window (RSSI tiebreak). */
-    int chall, other;
-    if (c0 > c1)                                      { chall = 0; other = 1; }
-    else if (c1 > c0)                                 { chall = 1; other = 0; }
-    else if (s->wmax_rssi[0] >= s->wmax_rssi[1])      { chall = 0; other = 1; }
-    else                                              { chall = 1; other = 0; }
-
-    if (chall != s->owner) {
-        if (s->wcount[other] == 0) {
-            if (s->wcount[chall] >= (unsigned)COUNT_DOM_FLIP) {
-                s->owner           = chall;
-                s->last_owner_rssi = s->wmax_rssi[chall];
-            }
-        } else if (s->wcount[chall] >= (unsigned)COUNT_DOM_FLIP * s->wcount[other]) {
-            s->owner           = chall;
-            s->last_owner_rssi = s->wmax_rssi[chall];
+    /* Flip rule: only if the OTHER antenna is the clear near-field
+       winner for FLIP_DEBOUNCE consecutive windows. Anything else
+       stays sticky -- this is the no-cross-read guarantee. */
+    int other = 1 - s->owner;
+    if (nf == other) {
+        s->flip_streak++;
+        if (s->flip_streak >= FLIP_DEBOUNCE) {
+            s->owner           = other;
+            s->last_owner_rssi = s->wmax_rssi[other];
+            s->flip_streak     = 0;
         }
-        /* else: stay on sticky owner (no cross-read flip) */
+    } else {
+        s->flip_streak = 0;
     }
 
     return true;
@@ -399,10 +418,10 @@ int main(int argc, char **argv) {
     printf("Power     : %u mW (both antennas)\n", power);
     printf("Window    : %d ms\n", GC_WINDOW_MS);
     printf("Antennas  : %s, %s  (150 mm centre-to-centre)\n", sources[0], sources[1]);
-    printf("Sticky    : floor=%.1f dBm, RSSI claim=%.1f dB, flip>=%dx, TTL=%d windows\n\n",
-           RSSI_FLOOR_DBM10 / 10.0,
+    printf("Sticky    : near-field=%.1f dBm, claim margin=%.1f dB, claim/flip debounce=%d/%d, TTL=%d\n\n",
+           NEAR_FIELD_DBM10 / 10.0,
            RSSI_CLAIM_MARGIN_DB10 / 10.0,
-           COUNT_DOM_FLIP, UNSEEN_TTL_WINDOWS);
+           CLAIM_DEBOUNCE, FLIP_DEBOUNCE, UNSEEN_TTL_WINDOWS);
 
     printf("[GC] Connecting...\n");
     ec = CAENRFID_Connect(&reader, CAENRFID_RS232, &port_params);
