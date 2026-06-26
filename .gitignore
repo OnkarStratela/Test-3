@@ -3,6 +3,8 @@ rfid_gc_live
 rfid_gc_live.exe
 rfid_standard
 rfid_standard.exe
+rfid_lowest
+rfid_lowest.exe
 
 # Object files
 *.o
