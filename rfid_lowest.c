@@ -1,23 +1,29 @@
 // rfid_lowest.c
 // Live-state RFID scanner using two antennas (Source_0 and Source_1).
 //
-// This is a variant of rfid_standard.c with ONE extra rule applied on
-// every print (sweep):
+// Cross-read suppression variant of rfid_standard.c. Two rules are
+// applied on every print (sweep):
 //
-//   If the SAME mug (same EPC) is detected on BOTH antennas at the same
-//   time, it is mapped to the source with the LOWEST RSSI and the
-//   highest-RSSI detection is completely discarded.
+//   1. NEAR-FIELD FLOOR: any detection weaker than NEAR_FIELD_DBM10
+//      (default -65.0 dBm) is discarded outright. A mug physically on
+//      an antenna reads ~-55..-60 dBm; leakage / cross reads from the
+//      other antenna read ~-65 dBm or weaker, so the floor removes them
+//      even when the home antenna missed that mug in the same sweep.
 //
-// "Lowest RSSI" means the smaller (more negative) dBm value, e.g.
-// -65.0 dBm is lower than -63.1 dBm, so the -65.0 reading is kept and
-// the -63.1 reading is dropped. A mug seen on only one antenna is left
-// untouched. Everything else (formatting, colours, fixed slots) is
-// identical to rfid_standard.
+//   2. STRONGEST WINS: if the SAME mug (same EPC) still survives on BOTH
+//      antennas, it is mapped to the source with the HIGHEST RSSI (the
+//      nearest / home antenna) and the weaker (lower RSSI) cross read is
+//      discarded.
+//
+// "Highest RSSI" means the larger (closer-to-zero) dBm value, e.g.
+// -57.0 dBm is higher than -65.0 dBm, so the -57.0 reading is kept and
+// the -65.0 reading is dropped. Everything else (formatting, colours,
+// fixed slots) is identical to rfid_standard.
 //
 // Output format (unchanged):
 //   []                                          empty sweep
-//   [TX=30 mW] [(0)(-65.0) <EPC>,                                      ]
-//   [TX=30 mW] [                                    ,   (1)(-65.0) <EPC>]
+//   [TX=30 mW] [(0)(-57.0) <EPC>,                                      ]
+//   [TX=30 mW] [                                    ,   (1)(-57.0) <EPC>]
 //
 // Antenna index in YELLOW; Src0 tag EPC in GREEN, Src1 tag EPC in RED.
 //
@@ -47,6 +53,11 @@
 #define GC_MAX_TAGS         64            // max tags merged across both antennas per sweep
 #define ANTENNA_COUNT       2
 #define MAX_ID_LENGTH       64
+
+// Near-field RSSI floor in tenths of dBm. Any read weaker (more
+// negative) than this is treated as leakage / a cross read and dropped.
+// -65.0 dBm is the cleanest home-vs-leakage split on this rig.
+#define NEAR_FIELD_DBM10    (-650)
 
 // ANSI colours
 #define GREEN  "\033[0;32m"
@@ -96,32 +107,45 @@ static void handle_sigint(int sig) {
     running = 0;
 }
 
-// Map each mug to the source with the LOWEST RSSI and discard the
-// highest-RSSI detection.
-//
-// For every EPC seen on BOTH antennas in this sweep we keep only the
-// reading with the lower (more negative) RSSI and remove the other one.
-// Mugs seen on a single antenna are left as-is.
-static void map_lowest_discard_highest(TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
-                                       int cnt[ANTENNA_COUNT])
+// Remove a single entry from one antenna bucket, shifting the rest down.
+static void bucket_remove(TagEntry bucket[GC_MAX_TAGS], int *cnt, int idx)
 {
+    for (int k = idx; k < *cnt - 1; k++)
+        bucket[k] = bucket[k + 1];
+    (*cnt)--;
+}
+
+// Cross-read suppression applied per sweep:
+//   1. Drop any read weaker than the near-field floor (leakage).
+//   2. For a mug surviving on BOTH antennas, keep the HIGHEST RSSI
+//      (nearest / home antenna) and discard the weaker cross read.
+static void suppress_cross_reads(TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
+                                 int cnt[ANTENNA_COUNT])
+{
+    // 1. Near-field floor: discard anything weaker than the threshold.
+    for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
+        for (int i = 0; i < cnt[ant]; i++) {
+            if (bucket[ant][i].rssi < NEAR_FIELD_DBM10) {
+                bucket_remove(bucket[ant], &cnt[ant], i);
+                i--;
+            }
+        }
+    }
+
+    // 2. Strongest wins for any mug still seen on both antennas.
     for (int i = 0; i < cnt[0]; i++) {
         for (int j = 0; j < cnt[1]; j++) {
             if (strcmp(bucket[0][i].tag, bucket[1][j].tag) != 0)
                 continue;
 
             // Same mug on both antennas at the same time.
-            if (bucket[0][i].rssi <= bucket[1][j].rssi) {
-                // Antenna 0 is the lowest RSSI -> keep it, drop antenna 1's copy.
-                for (int k = j; k < cnt[1] - 1; k++)
-                    bucket[1][k] = bucket[1][k + 1];
-                cnt[1]--;
+            if (bucket[0][i].rssi >= bucket[1][j].rssi) {
+                // Antenna 0 has the higher RSSI -> keep it, drop antenna 1's copy.
+                bucket_remove(bucket[1], &cnt[1], j);
                 j--;
             } else {
-                // Antenna 1 is the lowest RSSI -> keep it, drop antenna 0's copy.
-                for (int k = i; k < cnt[0] - 1; k++)
-                    bucket[0][k] = bucket[0][k + 1];
-                cnt[0]--;
+                // Antenna 1 has the higher RSSI -> keep it, drop antenna 0's copy.
+                bucket_remove(bucket[0], &cnt[0], i);
                 i--;
                 break; // bucket[0][i] changed; restart inner scan for it
             }
@@ -223,12 +247,13 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, handle_sigint);
 
-    printf(CYAN "===== Dual-Antenna RFID Live Scanner (lowest-RSSI mapping) =====" RESET "\n");
+    printf(CYAN "===== Dual-Antenna RFID Live Scanner (cross-read suppression) =====" RESET "\n");
     printf("Port      : %s @ %d baud\n", GC_PORT, GC_BAUDRATE);
     printf("Power     : %u mW (both antennas)\n", power);
     printf("Cycle     : %d ms\n", GC_SCAN_MS);
     printf("Antennas  : %s, %s\n", sources[0], sources[1]);
-    printf("Rule      : same mug on both antennas -> keep LOWEST RSSI, discard highest\n\n");
+    printf("Rule      : drop reads weaker than %.1f dBm; same mug on both -> keep HIGHEST RSSI\n\n",
+           NEAR_FIELD_DBM10 / 10.0);
 
     printf("[GC] Connecting...\n");
     ec = CAENRFID_Connect(&reader, CAENRFID_RS232, &port_params);
@@ -301,8 +326,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Keep the lowest-RSSI source per mug, discard highest when seen on both.
-        map_lowest_discard_highest(bucket, cnt);
+        // Drop leakage below the near-field floor; keep highest-RSSI source per mug.
+        suppress_cross_reads(bucket, cnt);
 
         print_sweep_line(power, bucket, cnt);
 
