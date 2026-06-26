@@ -15,6 +15,10 @@
 //      nearest / home antenna) and the weaker (lower RSSI) cross read is
 //      discarded.
 //
+//   3. STICKY OWNER: each mug remembers its antenna and only moves after
+//      the other antenna wins FLIP_DEBOUNCE sweeps in a row, so a single
+//      noisy sweep can never produce a momentary overlap.
+//
 // "Highest RSSI" means the larger (closer-to-zero) dBm value, e.g.
 // -57.0 dBm is higher than -65.0 dBm, so the -57.0 reading is kept and
 // the -65.0 reading is dropped. Everything else (formatting, colours,
@@ -59,6 +63,14 @@
 // -65.0 dBm is the cleanest home-vs-leakage split on this rig.
 #define NEAR_FIELD_DBM10    (-650)
 
+// Sticky-owner hysteresis. Once a mug is attributed to an antenna it
+// stays there; it only moves to the other antenna after that antenna
+// wins FLIP_DEBOUNCE sweeps in a row. This kills the occasional single-
+// sweep overlap caused by a momentary stronger leakage read. An EPC is
+// forgotten after UNSEEN_TTL sweeps without any sighting.
+#define FLIP_DEBOUNCE       3
+#define UNSEEN_TTL          6
+
 // ANSI colours
 #define GREEN  "\033[0;32m"
 #define RED    "\033[0;31m"
@@ -73,6 +85,20 @@ typedef struct {
     int     antenna;
     int16_t rssi;        /* tenths of dBm, as reported by the reader */
 } TagEntry;
+
+// Persistent per-mug ownership used for the sticky-owner hysteresis.
+//   owner       : -1 until first attribution, then 0 or 1
+//   last_rssi   : last RSSI shown for this mug (tenths dBm)
+//   flip_streak : consecutive sweeps the NON-owner antenna won
+//   unseen      : consecutive sweeps with no sighting (drives eviction)
+typedef struct {
+    char     epc[2 * MAX_ID_LENGTH + 1];
+    int      owner;
+    int16_t  last_rssi;
+    int      flip_streak;
+    int      unseen;
+    bool     in_use;
+} TagOwn;
 
 static void hex_str(uint8_t *bytes, uint16_t len, char *out) {
     for (int i = 0; i < len; i++)
@@ -149,6 +175,110 @@ static void suppress_cross_reads(TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
                 i--;
                 break; // bucket[0][i] changed; restart inner scan for it
             }
+        }
+    }
+}
+
+// Locate (or allocate) the ownership row for `epc`. Returns NULL only if
+// the table is full (never happens with a couple of mugs on the tray).
+static TagOwn *own_find_or_insert(TagOwn *tbl, const char *epc)
+{
+    int free_slot = -1;
+    for (int i = 0; i < GC_MAX_TAGS; i++) {
+        if (tbl[i].in_use) {
+            if (strcmp(tbl[i].epc, epc) == 0) return &tbl[i];
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < 0) return NULL;
+    TagOwn *s = &tbl[free_slot];
+    memset(s, 0, sizeof *s);
+    strncpy(s->epc, epc, sizeof s->epc - 1);
+    s->epc[sizeof s->epc - 1] = '\0';
+    s->owner       = -1;
+    s->last_rssi   = INT16_MIN;
+    s->flip_streak = 0;
+    s->unseen      = 0;
+    s->in_use      = true;
+    return s;
+}
+
+// Force every surviving mug onto its sticky owner antenna. Each EPC is
+// on at most one antenna here (suppress_cross_reads already collapsed
+// same-sweep duplicates). A mug only changes antenna after the other
+// antenna wins FLIP_DEBOUNCE sweeps in a row, so a single stray read
+// can never produce an overlap.
+static void apply_sticky_owner(TagOwn *tbl,
+                               TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
+                               int cnt[ANTENNA_COUNT])
+{
+    // Snapshot this sweep's survivors before we rebuild the buckets.
+    TagEntry survivors[ANTENNA_COUNT * GC_MAX_TAGS];
+    int ns = 0;
+    for (int ant = 0; ant < ANTENNA_COUNT; ant++)
+        for (int i = 0; i < cnt[ant]; i++)
+            survivors[ns++] = bucket[ant][i];
+
+    bool seen[GC_MAX_TAGS] = { false };
+
+    cnt[0] = 0;
+    cnt[1] = 0;
+
+    for (int s = 0; s < ns; s++) {
+        TagOwn *st = own_find_or_insert(tbl, survivors[s].tag);
+        int cand = survivors[s].antenna;
+
+        if (st == NULL) {
+            // Table full: fall back to showing it where it was read.
+            if (cnt[cand] < GC_MAX_TAGS)
+                bucket[cand][cnt[cand]++] = survivors[s];
+            continue;
+        }
+
+        seen[(int)(st - tbl)] = true;
+        st->unseen = 0;
+
+        if (st->owner < 0) {
+            st->owner = cand;            // first sighting claims ownership
+            st->flip_streak = 0;
+        } else if (cand == st->owner) {
+            st->flip_streak = 0;         // owner confirmed, reset challenger
+        } else {
+            st->flip_streak++;           // other antenna is challenging
+            if (st->flip_streak >= FLIP_DEBOUNCE) {
+                st->owner = cand;        // sustained -> hand over ownership
+                st->flip_streak = 0;
+            }
+        }
+
+        int16_t rssi;
+        if (cand == st->owner) {
+            st->last_rssi = survivors[s].rssi;
+            rssi = survivors[s].rssi;
+        } else {
+            // Read on the non-owner this sweep: keep it on the owner slot
+            // using the last RSSI the owner saw (falls back to this read).
+            rssi = (st->last_rssi != INT16_MIN) ? st->last_rssi
+                                                : survivors[s].rssi;
+        }
+
+        int ant = st->owner;
+        if (cnt[ant] < GC_MAX_TAGS) {
+            strncpy(bucket[ant][cnt[ant]].tag, st->epc,
+                    sizeof bucket[ant][cnt[ant]].tag - 1);
+            bucket[ant][cnt[ant]].tag[sizeof bucket[ant][cnt[ant]].tag - 1] = '\0';
+            bucket[ant][cnt[ant]].antenna = ant;
+            bucket[ant][cnt[ant]].rssi    = rssi;
+            cnt[ant]++;
+        }
+    }
+
+    // Age out mugs that were not seen this sweep so the slot can clear.
+    for (int k = 0; k < GC_MAX_TAGS; k++) {
+        if (tbl[k].in_use && !seen[k]) {
+            if (++tbl[k].unseen >= UNSEEN_TTL)
+                tbl[k].in_use = false;
         }
     }
 }
@@ -252,8 +382,10 @@ int main(int argc, char **argv) {
     printf("Power     : %u mW (both antennas)\n", power);
     printf("Cycle     : %d ms\n", GC_SCAN_MS);
     printf("Antennas  : %s, %s\n", sources[0], sources[1]);
-    printf("Rule      : drop reads weaker than %.1f dBm; same mug on both -> keep HIGHEST RSSI\n\n",
+    printf("Rule      : drop reads weaker than %.1f dBm; same mug on both -> keep HIGHEST RSSI\n",
            NEAR_FIELD_DBM10 / 10.0);
+    printf("Sticky    : owner flips only after %d sweeps; forget after %d unseen\n\n",
+           FLIP_DEBOUNCE, UNSEEN_TTL);
 
     printf("[GC] Connecting...\n");
     ec = CAENRFID_Connect(&reader, CAENRFID_RS232, &port_params);
@@ -285,6 +417,9 @@ int main(int argc, char **argv) {
 
     TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS];
     int      cnt[ANTENNA_COUNT];
+
+    /* Persistent ownership table for the sticky-owner hysteresis. */
+    TagOwn owners[GC_MAX_TAGS] = {0};
 
     while (running) {
 
@@ -328,6 +463,9 @@ int main(int argc, char **argv) {
 
         // Drop leakage below the near-field floor; keep highest-RSSI source per mug.
         suppress_cross_reads(bucket, cnt);
+
+        // Pin each mug to its sticky owner so a stray sweep can't overlap.
+        apply_sticky_owner(owners, bucket, cnt);
 
         print_sweep_line(power, bucket, cnt);
 
